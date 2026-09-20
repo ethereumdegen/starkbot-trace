@@ -135,6 +135,7 @@ async fn drain(
     let mut lines = BufReader::new(stream).lines();
     let mut stored = 0_u64;
     let mut bad = 0_u64;
+    let mut foreign = 0_u64;
     let mut source = String::new();
 
     loop {
@@ -153,26 +154,50 @@ async fn drain(
             continue;
         }
 
-        let record: neo_trace::Record = match serde_json::from_str(&line) {
-            Ok(record) => record,
-            Err(error) => {
-                bad += 1;
-                // Only the first few, so a producer speaking a future wire
-                // version cannot fill the terminal.
-                if bad <= 3 {
-                    eprintln!("trace: {peer} sent a line this build cannot read: {error}");
+        // A body this build has no type for is still worth keeping: the two
+        // programs are released separately and the envelope is what the
+        // reports actually need. Only a line that is not even an envelope is
+        // rejected.
+        let stored_id = match serde_json::from_str::<neo_trace::Record>(&line) {
+            Ok(record) => {
+                if source.is_empty() {
+                    source = record.source.clone();
                 }
-                continue;
+                // The insert is a local WAL append of a few hundred bytes, so
+                // it runs on this task rather than going through
+                // `spawn_blocking`: the hop would cost more than the write.
+                trace.insert(&record)
             }
+            Err(known) => match serde_json::from_str::<crate::store::ForeignRecord>(&line) {
+                Ok(record) => {
+                    if source.is_empty() {
+                        source = record.source.clone();
+                    }
+                    if foreign <= 3 {
+                        // Naming the producer's wire version is the whole
+                        // diagnosis when a new Neo meets an old collector.
+                        eprintln!(
+                            "trace: {peer} sent `{}` at wire v{} (this build speaks v{}) — stored whole",
+                            record.kind(),
+                            record.v,
+                            neo_trace::WIRE_VERSION
+                        );
+                    }
+                    foreign += 1;
+                    trace.insert_foreign(&record)
+                }
+                Err(_) => {
+                    bad += 1;
+                    // Only the first few, so a broken producer cannot fill the
+                    // terminal.
+                    if bad <= 3 {
+                        eprintln!("trace: {peer} sent a line this build cannot read: {known}");
+                    }
+                    continue;
+                }
+            },
         };
-        if source.is_empty() {
-            source = record.source.clone();
-        }
-
-        // The insert is a local WAL append of a few hundred bytes, so it runs
-        // on this task rather than going through `spawn_blocking`: the hop
-        // would cost more than the write.
-        match trace.insert(&record) {
+        match stored_id {
             Ok(_) => {
                 stored += 1;
                 let seen = total.fetch_add(1, Ordering::Relaxed) + 1;
@@ -199,7 +224,10 @@ async fn drain(
     } else {
         format!("{source} ({peer})")
     };
-    eprintln!("trace: {who} closed after {stored} records, {bad} rejected");
+    eprintln!(
+        "trace: {who} closed after {stored} records, {foreign} of a kind this build does not know, \
+         {bad} rejected"
+    );
     Ok(())
 }
 

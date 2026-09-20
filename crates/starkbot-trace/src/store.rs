@@ -20,7 +20,7 @@ use neo_trace::{Body, Record};
 use rusqlite::types::Value;
 use rusqlite::{Connection, params_from_iter};
 use rusqlite_migration::{M, Migrations};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// `TRC1`. A trace database and a Neo database both live under Application
 /// Support and both end in `.db`; the magic number is what stops
@@ -212,8 +212,48 @@ impl Trace {
     /// between them can never leave `runs.records` describing rows that are
     /// not there.
     pub fn insert(&self, record: &Record) -> Result<i64> {
-        let flat = Flat::from(&record.body);
-        let body = serde_json::to_string(&record.body)?;
+        self.insert_parts(
+            &Envelope {
+                seq: record.seq,
+                ts_ms: record.ts_ms,
+                run: &record.run,
+                source: &record.source,
+                pid: record.pid,
+                turn: record.turn.as_deref(),
+                dropped: record.dropped,
+                kind: record.body.kind(),
+            },
+            &Flat::from(&record.body),
+            &serde_json::to_string(&record.body)?,
+        )
+    }
+
+    /// Store a record whose body this build does not have a type for.
+    ///
+    /// The socket is the contract, not the crate: a Neo built against a newer
+    /// `neo-trace` can emit a kind this collector has never heard of, and
+    /// dropping it would lose exactly the trace the upgrade was made to see.
+    /// The envelope is stable, so the record is stored whole — `tail`, `turn`
+    /// and the filters all work on it; only the flat columns the unknown body
+    /// would have filled stay empty.
+    pub fn insert_foreign(&self, record: &ForeignRecord) -> Result<i64> {
+        self.insert_parts(
+            &Envelope {
+                seq: record.seq,
+                ts_ms: record.ts_ms,
+                run: &record.run,
+                source: &record.source,
+                pid: record.pid,
+                turn: record.turn.as_deref(),
+                dropped: record.dropped,
+                kind: record.kind(),
+            },
+            &Flat::foreign(&record.body),
+            &serde_json::to_string(&record.body)?,
+        )
+    }
+
+    fn insert_parts(&self, envelope: &Envelope<'_>, flat: &Flat, body: &str) -> Result<i64> {
         let mut guard = self.lock();
         let transaction = guard.transaction()?;
 
@@ -231,12 +271,12 @@ impl Trace {
                records = runs.records + 1, \
                dropped = MAX(runs.dropped, excluded.dropped)",
             rusqlite::params![
-                &record.run,
-                &record.source,
-                i64::from(record.pid),
-                record.ts_ms,
-                record.ts_ms,
-                as_i64(record.dropped),
+                envelope.run,
+                envelope.source,
+                i64::from(envelope.pid),
+                envelope.ts_ms,
+                envelope.ts_ms,
+                as_i64(envelope.dropped),
             ],
         )?;
 
@@ -245,13 +285,13 @@ impl Trace {
              ok, provider, model, operation, surface, input_tokens, output_tokens, body) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![
-                as_i64(record.seq),
-                record.ts_ms,
-                &record.run,
-                &record.source,
-                i64::from(record.pid),
-                &record.turn,
-                record.body.kind(),
+                as_i64(envelope.seq),
+                envelope.ts_ms,
+                envelope.run,
+                envelope.source,
+                i64::from(envelope.pid),
+                envelope.turn,
+                envelope.kind,
                 &flat.label,
                 flat.duration_ms.map(as_i64),
                 flat.ok,
@@ -261,7 +301,7 @@ impl Trace {
                 &flat.surface,
                 flat.input_tokens.map(as_i64),
                 flat.output_tokens.map(as_i64),
-                &body,
+                body,
             ],
         )?;
         let id = transaction.last_insert_rowid();
@@ -595,6 +635,50 @@ impl Filter {
     }
 }
 
+/// A record whose envelope parsed but whose body this build has no type for.
+///
+/// The wire is the contract between two independently released programs, so
+/// the collector has to survive meeting a newer producer. Everything a report
+/// needs to place a record — when, which run, which turn — lives in the
+/// envelope, and the body is kept verbatim.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ForeignRecord {
+    pub v: u32,
+    pub seq: u64,
+    pub ts_ms: i64,
+    pub run: String,
+    pub source: String,
+    pub pid: u32,
+    #[serde(default)]
+    pub turn: Option<String>,
+    #[serde(default)]
+    pub dropped: u64,
+    pub body: serde_json::Value,
+}
+
+impl ForeignRecord {
+    /// The body's own tag, or `unknown` when it carries none.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        self.body
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+    }
+}
+
+/// The envelope columns, shared by both ingest paths.
+struct Envelope<'a> {
+    seq: u64,
+    ts_ms: i64,
+    run: &'a str,
+    source: &'a str,
+    pid: u32,
+    turn: Option<&'a str>,
+    dropped: u64,
+    kind: &'a str,
+}
+
 /// The columns lifted out of a record body at ingest.
 struct Flat {
     label: String,
@@ -609,6 +693,23 @@ struct Flat {
 }
 
 impl Flat {
+    /// The little that can be said about a body this build cannot name: a
+    /// duration if it carries one under the usual key, and the body itself as
+    /// the label, so `tail` still shows something a person can read.
+    fn foreign(body: &serde_json::Value) -> Self {
+        Self {
+            label: one_line(&body.to_string()),
+            duration_ms: body.get("duration_ms").and_then(serde_json::Value::as_u64),
+            ok: body.get("ok").and_then(serde_json::Value::as_bool),
+            provider: None,
+            model: None,
+            operation: None,
+            surface: None,
+            input_tokens: None,
+            output_tokens: None,
+        }
+    }
+
     fn from(body: &Body) -> Self {
         let mut flat = Self {
             label: String::new(),
@@ -1176,5 +1277,45 @@ mod tests {
             .expect("rows after an id");
         assert_eq!(after.len(), 2);
         assert!(after.iter().all(|row| row.id > everything[3].id));
+    }
+
+    /// A newer producer's record is kept whole rather than dropped: this is
+    /// what lets the two programs ship on their own schedules.
+    #[test]
+    fn a_kind_this_build_does_not_know_is_still_stored_and_filterable() {
+        let (_directory, trace) = open();
+        let line = json!({
+            "v": 2,
+            "seq": 1,
+            "ts_ms": 1_700_000_000_000_i64,
+            "run": "run-future",
+            "source": "neo-tui",
+            "pid": 91,
+            "turn": "turn-future",
+            "dropped": 0,
+            "body": { "kind": "voice_utterance", "duration_ms": 640, "words": 12 }
+        })
+        .to_string();
+        let foreign: ForeignRecord = serde_json::from_str(&line).expect("envelope parses");
+        assert_eq!(foreign.kind(), "voice_utterance");
+        trace.insert_foreign(&foreign).expect("store it");
+
+        let rows = trace
+            .rows(
+                &Filter {
+                    kinds: vec!["voice_utterance".to_string()],
+                    ..Filter::default()
+                },
+                10,
+            )
+            .expect("filter by the unknown kind");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].turn.as_deref(), Some("turn-future"));
+        assert_eq!(rows[0].duration_ms, Some(640));
+        assert_eq!(rows[0].body["words"], json!(12));
+
+        let runs = trace.runs(10).expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].records, 1);
     }
 }
