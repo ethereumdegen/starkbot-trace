@@ -1,39 +1,41 @@
 #![forbid(unsafe_code)]
-//! A separate program from Neo on purpose.
+//! An OTLP receiver that is also a reader.
 //!
-//! The agent's job is to finish a task; this one's job is to remember what it
-//! did. Keeping them apart means the collector can be restarted, upgraded,
-//! pointed at a different database or killed outright without any of that
-//! reaching the agent — the producer side is fire-and-forget, so a missing
-//! collector is simply a quiet one. It also means the trace survives the
-//! process that produced it, which is the only reason any of this is useful
-//! after a crash.
+//! This program shares no code with the agents it records — it shares a
+//! protocol. Spans arrive over OTLP/HTTP, the way they would arrive at an
+//! OpenTelemetry Collector, which means the producer can be restarted,
+//! upgraded, rewritten or replaced with something else entirely without this
+//! program knowing, and this one can be killed, moved or pointed at a
+//! different database without any of that reaching the agent. It also means
+//! the trace outlives the process that produced it, which is the only reason
+//! any of this is useful after a crash.
 
 mod otlp;
+mod receiver;
 mod report;
-mod server;
 mod store;
 mod watch;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use store::{Filter, Trace};
+use store::{Filter, Store};
 
 #[derive(Parser)]
 #[command(
     name = "starkbot-trace",
     version,
-    about = "Collect and read Starkbot Neo execution traces"
+    about = "Receive and read OpenTelemetry traces from Starkbot Neo"
 )]
 struct Cli {
     /// The trace database. Defaults to `$STARKBOT_TRACE_DB`, else
     /// `~/Library/Application Support/com.starkbot.trace/trace.db`.
     // Global rather than declared on each subcommand: clap rejects the same
-    // argument name in both places, and `serve --db` has to mean what
+    // argument name in both places, and `receive --db` has to mean what
     // `tail --db` means.
     #[arg(long, global = true, value_name = "PATH")]
     db: Option<PathBuf>,
@@ -43,34 +45,37 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Listen on the trace socket and store everything Neo sends.
-    Serve {
-        /// Defaults to `$STARKBOT_TRACE_SOCKET`, else
-        /// `~/Library/Application Support/com.starkbot.neo/trace.sock`.
-        #[arg(long, value_name = "PATH")]
-        socket: Option<PathBuf>,
-        /// Also append every raw line here, for `jq`.
+    /// Accept OTLP/HTTP spans and store everything that arrives.
+    Receive {
+        /// Where to listen. An OTLP producer expects `127.0.0.1:4318`.
+        #[arg(long, value_name = "ADDR", default_value = receiver::DEFAULT_ADDR)]
+        addr: SocketAddr,
+        /// Also append every raw document here, one per line, for `jq`.
         #[arg(long, value_name = "PATH")]
         mirror: Option<PathBuf>,
-        /// Also forward each turn to this OTLP endpoint as it closes. The
+        /// Also forward each span to this OTLP endpoint as it arrives. The
         /// base URL, e.g. `http://localhost:4318`.
         #[arg(long, value_name = "URL")]
         otlp: Option<String>,
-        /// An extra header on every OTLP request, `name: value`. Repeatable.
+        /// An extra header on every forwarded request, `name: value`.
+        /// Repeatable.
         #[arg(long = "header", value_name = "K: V")]
         header: Vec<String>,
     },
-    /// The most recent records.
+    /// The most recent spans.
     Tail {
-        /// How many records to show.
+        /// How many spans to show.
         #[arg(short = 'n', long = "limit", default_value_t = 40, value_name = "N")]
         limit: usize,
-        /// Keep printing as new records arrive.
+        /// Keep printing as new spans arrive.
         #[arg(long)]
         follow: bool,
-        /// Only this record kind. Repeatable.
-        #[arg(long, value_name = "KIND")]
-        kind: Vec<String>,
+        /// Only spans with this name, e.g. `invoke_agent`. Repeatable.
+        #[arg(long, value_name = "NAME")]
+        name: Vec<String>,
+        /// Only this trace. An id prefix is enough.
+        #[arg(long, value_name = "ID")]
+        trace: Option<String>,
         /// Only this turn. An id prefix is enough.
         #[arg(long, value_name = "ID")]
         turn: Option<String>,
@@ -80,7 +85,7 @@ enum Command {
         /// Only the last this many minutes.
         #[arg(long, value_name = "MINUTES")]
         since: Option<i64>,
-        /// Only records whose label or body contains this.
+        /// Only spans whose label, name or attributes contain this.
         #[arg(long, value_name = "TEXT")]
         grep: Option<String>,
         /// One JSON array instead of a table.
@@ -105,9 +110,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Everything that happened in one turn. An id prefix is enough.
+    /// Everything that happened in one turn, as a waterfall. An id prefix is
+    /// enough.
     Turn {
-        /// The turn id, or as much of it as `turns` printed.
+        /// The trace id, or as much of it as `turns` printed.
         id: String,
         /// JSON instead of a table.
         #[arg(long)]
@@ -122,9 +128,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Map stored records to OpenTelemetry spans and send them over OTLP.
+    /// Re-post stored spans to another OTLP endpoint.
     Export {
-        /// The collector's base URL, e.g. `http://localhost:4318`. Defaults
+        /// The endpoint's base URL, e.g. `http://localhost:4318`. Defaults
         /// to `$OTEL_EXPORTER_OTLP_ENDPOINT`.
         #[arg(long, value_name = "URL")]
         otlp: Option<String>,
@@ -136,17 +142,13 @@ enum Command {
         /// Only the last this many minutes.
         #[arg(long, value_name = "MINUTES")]
         since: Option<i64>,
-        /// Only this turn. An id prefix is enough.
+        /// Only this trace. An id prefix is enough.
         #[arg(long, value_name = "ID")]
-        turn: Option<String>,
-        /// Only this run. An id prefix is enough.
-        #[arg(long, value_name = "ID")]
-        run: Option<String>,
-        /// Keep exporting as new records arrive. Each turn goes out once it
-        /// has closed.
+        trace: Option<String>,
+        /// Keep exporting as new spans arrive.
         #[arg(long)]
         follow: bool,
-        /// Print the OTLP payload instead of sending it.
+        /// Print the OTLP document instead of sending it.
         #[arg(long)]
         dry_run: bool,
     },
@@ -155,140 +157,135 @@ enum Command {
 }
 
 /// `main` stays synchronous so the reports and the dashboard run on the plain
-/// thread they were written for; only `serve` needs a reactor, and it builds
-/// its own.
+/// thread they were written for; only the receiver and the exporter need a
+/// reactor, and they build their own.
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve {
-            socket,
+        Command::Receive {
+            addr,
             mirror,
             otlp,
             header,
         } => {
-            let socket = match socket {
-                Some(path) => path,
-                None => server::default_socket()?,
-            };
             let database = database_path(cli.db)?;
-            eprintln!("trace: socket {}", socket.display());
             eprintln!("trace: database {}", database.display());
             // Built before the listener starts: a bad endpoint or an
-            // unparseable header should stop the collector here, not on the
+            // unparseable header should stop the receiver here, not on the
             // first turn hours later.
             let egress = match otlp {
                 Some(endpoint) => {
-                    eprintln!("trace: exporting to {endpoint}");
+                    eprintln!("trace: forwarding to {endpoint}");
                     Some(otlp::Egress::new(Some(&endpoint), &header, false)?)
                 }
                 None => None,
             };
-            let trace = Arc::new(Trace::open(&database)?);
-            run_serve(trace, socket, mirror, egress)
+            let store = Arc::new(Store::open(&database)?);
+            run_receive(store, addr, mirror, egress)
         }
         Command::Tail {
             limit,
             follow,
-            kind,
+            name,
+            trace,
             turn,
             run,
             since,
             grep,
             json,
         } => {
-            let trace = open(cli.db)?;
+            let store = open(cli.db)?;
             let filter = Filter {
                 run,
+                trace,
                 turn,
-                kinds: kind,
-                since_ms: since.map(minutes_ago),
+                names: name,
+                since_ns: since.map(minutes_ago),
                 text: grep,
             };
-            report::tail(&trace, &filter, limit, follow, json)
+            report::tail(&store, &filter, limit, follow, json)
         }
         Command::Stats { since, json } => {
-            let trace = open(cli.db)?;
-            report::stats(&trace, since.map(minutes_ago), json)
+            let store = open(cli.db)?;
+            report::stats(&store, since.map(minutes_ago), json)
         }
         Command::Turns { limit, json } => {
-            let trace = open(cli.db)?;
-            report::turns(&trace, limit, json)
+            let store = open(cli.db)?;
+            report::turns(&store, limit, json)
         }
         Command::Turn { id, json } => {
-            let trace = open(cli.db)?;
-            report::turn(&trace, &id, json)
+            let store = open(cli.db)?;
+            report::turn(&store, &id, json)
         }
         Command::Runs { limit, json } => {
-            let trace = open(cli.db)?;
-            report::runs(&trace, limit, json)
+            let store = open(cli.db)?;
+            report::runs(&store, limit, json)
         }
         Command::Watch => {
-            let trace = open(cli.db)?;
-            watch::watch(&trace)
+            let store = open(cli.db)?;
+            watch::watch(&store)
         }
         Command::Export {
             otlp,
             header,
             since,
-            turn,
-            run,
+            trace,
             follow,
             dry_run,
         } => {
-            let trace = open(cli.db)?;
+            let store = open(cli.db)?;
             let filter = Filter {
-                run,
-                turn,
-                kinds: Vec::new(),
-                since_ms: since.map(minutes_ago),
-                text: None,
+                trace,
+                since_ns: since.map(minutes_ago),
+                ..Filter::default()
             };
             let egress = otlp::Egress::new(otlp.as_deref(), &header, dry_run)?;
-            run_export(trace, filter, egress, follow)
+            run_export(store, filter, egress, follow)
         }
     }
 }
 
 #[tokio::main]
-async fn run_serve(
-    trace: Arc<Trace>,
-    socket: PathBuf,
+async fn run_receive(
+    store: Arc<Store>,
+    addr: SocketAddr,
     mirror: Option<PathBuf>,
     egress: Option<otlp::Egress>,
 ) -> Result<()> {
-    server::serve(trace, &socket, mirror.as_deref(), egress).await
+    receiver::receive(store, addr, mirror.as_deref(), egress).await
 }
 
-/// The export needs a reactor for the same reason `serve` does and for no
-/// other: `reqwest` is async.
+/// The export needs a reactor for the same reason the receiver does and for
+/// no other: `reqwest` is async.
 #[tokio::main]
 async fn run_export(
-    trace: Trace,
+    store: Store,
     filter: Filter,
     egress: otlp::Egress,
     follow: bool,
 ) -> Result<()> {
     if follow {
-        otlp::follow(&trace, &filter, &egress).await
+        otlp::follow(&store, &filter, &egress).await
     } else {
-        otlp::export(&trace, &filter, &egress).await
+        otlp::export(&store, &filter, &egress).await
     }
 }
 
-fn open(db: Option<PathBuf>) -> Result<Trace> {
-    Trace::open(&database_path(db)?)
+fn open(db: Option<PathBuf>) -> Result<Store> {
+    Store::open(&database_path(db)?)
 }
 
 fn database_path(db: Option<PathBuf>) -> Result<PathBuf> {
     match db {
         Some(path) => Ok(path),
-        None => Trace::default_path(),
+        None => Store::default_path().context("no --db and no default database path"),
     }
 }
 
 /// `--since` is minutes because that is how long ago the thing you are
-/// looking for happened; the store speaks epoch milliseconds.
+/// looking for happened; the store speaks unix nanoseconds.
 fn minutes_ago(minutes: i64) -> i64 {
-    let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1_000;
-    now - minutes.saturating_mul(60_000)
+    let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    now - minutes.saturating_mul(60_000_000_000)
 }

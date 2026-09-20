@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Collector and reporter for Starkbot Neo execution traces."
+description = "An OTLP receiver and reader for agent traces."
 
 [[bin]]
 name = "starkbot-trace"
@@ -18,7 +18,7 @@ workspace = true
 anyhow.workspace = true
 clap.workspace = true
 crossterm.workspace = true
-neo-trace.workspace = true
+flate2.workspace = true
 ratatui.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true

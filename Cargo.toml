@@ -15,6 +15,7 @@ clippy = { unwrap_used = "deny", expect_used = "warn", dbg_macro = "deny", print
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
+flate2 = "1"
 ratatui = "0.30"
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
@@ -28,8 +29,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
 time = { version = "0.3", features = ["serde", "formatting"] }
 tokio = { version = "1", features = ["full"] }
-uuid = { version = "1", features = ["serde", "v7"] }
-neo-trace = { path = "crates/neo-trace" }
 
 [profile.dev]
 opt-level = 1

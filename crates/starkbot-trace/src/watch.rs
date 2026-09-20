@@ -3,9 +3,9 @@
 //! `tail --follow` answers "what is happening right now" one line at a time,
 //! which is the wrong shape for watching: by the time an interesting jev step
 //! scrolls past, the turn it belonged to is gone. This surface keeps the
-//! recent turns, the live record stream and the last fifteen minutes of
+//! recent turns, the live span stream and the last fifteen minutes of
 //! latency on screen at once, and lets a turn be pinned so the stream shows
-//! only that turn's records.
+//! only that turn's spans.
 //!
 //! It owns the terminal while it runs, so every exit path — quit, error, or
 //! panic — goes through a guard that hands raw mode back.
@@ -24,7 +24,7 @@ use ratatui::{DefaultTerminal, Frame};
 use time::OffsetDateTime;
 
 use crate::report::{clip, clock, fmt_ms, short_id, stamp};
-use crate::store::{Filter, Row, Stats, Trace, TurnSummary};
+use crate::store::{Filter, Span as StoredSpan, Stats, Store, TurnSummary};
 
 /// How long a frame waits for a key before the store is polled again. It is
 /// also the refresh cadence: fast enough to read as live, slow enough that an
@@ -32,8 +32,8 @@ use crate::store::{Filter, Row, Stats, Trace, TurnSummary};
 const TICK: Duration = Duration::from_millis(250);
 /// The window the side panel summarises. Long enough to cover the turn that
 /// just ran, short enough that yesterday's numbers do not hide today's.
-const WINDOW_MS: i64 = 15 * 60 * 1_000;
-/// Records kept in memory for the stream pane, and the most fetched per poll.
+const WINDOW_NS: i64 = 15 * 60 * 1_000_000_000;
+/// Spans kept in memory for the stream pane, and the most fetched per poll.
 const STREAM_CAP: usize = 500;
 const STREAM_BATCH: usize = 200;
 /// Turns offered in the list.
@@ -45,9 +45,9 @@ const SIDE_WIDTH: u16 = 32;
 const GREY: Color = Color::DarkGray;
 
 /// Take over the terminal, run the dashboard, and give the terminal back.
-pub fn watch(trace: &Trace) -> Result<()> {
+pub fn watch(store: &Store) -> Result<()> {
     let mut guard = TerminalGuard::new()?;
-    event_loop(trace, &mut guard.terminal)
+    event_loop(store, &mut guard.terminal)
 }
 
 /// Restores the terminal on drop. `ratatui::try_init` additionally installs a
@@ -74,8 +74,8 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn event_loop(trace: &Trace, terminal: &mut DefaultTerminal) -> Result<()> {
-    let mut dashboard = Dashboard::new(trace)?;
+fn event_loop(store: &Store, terminal: &mut DefaultTerminal) -> Result<()> {
+    let mut dashboard = Dashboard::new(store)?;
     let mut last_refresh = Instant::now();
     loop {
         terminal.draw(|frame| draw(frame, &dashboard))?;
@@ -86,7 +86,7 @@ fn event_loop(trace: &Trace, terminal: &mut DefaultTerminal) -> Result<()> {
                 // that report releases, and a dashboard that acts twice per
                 // keystroke skips a turn every time the selection moves.
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if dashboard.on_key(key, trace)? == Flow::Quit {
+                    if dashboard.on_key(key, store)? == Flow::Quit {
                         return Ok(());
                     }
                 }
@@ -95,7 +95,7 @@ fn event_loop(trace: &Trace, terminal: &mut DefaultTerminal) -> Result<()> {
         }
 
         if last_refresh.elapsed() >= TICK {
-            dashboard.refresh(trace)?;
+            dashboard.refresh(store)?;
             last_refresh = Instant::now();
         }
     }
@@ -112,7 +112,7 @@ enum Flow {
 struct Dashboard {
     turns: Vec<TurnSummary>,
     selected: usize,
-    stream: VecDeque<Row>,
+    stream: VecDeque<StoredSpan>,
     last_id: i64,
     filter: Filter,
     stats: Stats,
@@ -120,59 +120,62 @@ struct Dashboard {
 }
 
 impl Dashboard {
-    fn new(trace: &Trace) -> Result<Self> {
+    fn new(store: &Store) -> Result<Self> {
         let mut dashboard = Self {
             turns: Vec::new(),
             selected: 0,
             stream: VecDeque::new(),
             last_id: 0,
             filter: Filter::default(),
-            stats: trace.stats(Some(window_start()))?,
+            stats: store.stats(Some(window_start()))?,
             paused: false,
         };
-        dashboard.reload_stream(trace)?;
-        dashboard.refresh(trace)?;
+        dashboard.reload_stream(store)?;
+        dashboard.refresh(store)?;
         Ok(dashboard)
     }
 
-    /// Start the stream from the newest records. `rows_after(0, …)` would
-    /// replay the database from its very first record instead, which on a
-    /// week-old collector means the pane shows last Tuesday.
-    fn reload_stream(&mut self, trace: &Trace) -> Result<()> {
-        let rows = trace.rows(&self.filter, STREAM_CAP)?;
-        self.last_id = rows.last().map_or(0, |row| row.id);
-        self.stream = rows.into_iter().collect();
+    /// Start the stream from the newest spans. `spans_after(0, …)` would
+    /// replay the database from its very first span instead, which on a
+    /// week-old database means the pane shows last Tuesday.
+    fn reload_stream(&mut self, store: &Store) -> Result<()> {
+        let spans = store.spans(&self.filter, STREAM_CAP)?;
+        self.last_id = spans.last().map_or(0, |span| span.id);
+        self.stream = spans.into_iter().collect();
         Ok(())
     }
 
-    fn refresh(&mut self, trace: &Trace) -> Result<()> {
-        let anchor = self.turns.get(self.selected).map(|turn| turn.turn.clone());
-        self.turns = trace.turns(TURN_CAP)?;
+    fn refresh(&mut self, store: &Store) -> Result<()> {
+        let anchor = self
+            .turns
+            .get(self.selected)
+            .map(|turn| turn.trace_id.clone());
+        self.turns = store.turns(TURN_CAP)?;
         // New turns arrive at the top of the list, so the cursor follows the
         // turn the user picked rather than sliding down under them.
         self.selected = anchor
-            .and_then(|id| self.turns.iter().position(|turn| turn.turn == id))
+            .and_then(|id| self.turns.iter().position(|turn| turn.trace_id == id))
             .unwrap_or(self.selected)
             .min(self.turns.len().saturating_sub(1));
-        self.stats = trace.stats(Some(window_start()))?;
+        self.stats = store.stats(Some(window_start()))?;
 
         if self.paused {
             return Ok(());
         }
-        let rows = trace.rows_after(self.last_id, &self.filter, STREAM_BATCH)?;
-        if let Some(row) = rows.last() {
-            self.last_id = row.id;
+        let spans = store.spans_after(self.last_id, &self.filter, STREAM_BATCH)?;
+        if let Some(span) = spans.last() {
+            self.last_id = span.id;
         }
-        for row in rows {
+        for span in spans {
             while self.stream.len() >= STREAM_CAP {
                 self.stream.pop_front();
             }
-            self.stream.push_back(row);
+            self.stream.push_back(span);
         }
         Ok(())
     }
 
-    fn on_key(&mut self, key: KeyEvent, trace: &Trace) -> Result<Flow> {
+    fn on_key(&mut self, key: KeyEvent, store: &Store) -> Result<Flow> {
         match key.code {
             // Raw mode swallows SIGINT, so Ctrl-C arrives as a key: without
             // this arm the habitual way out of a terminal program does
@@ -185,18 +188,20 @@ impl Dashboard {
             // whole view because you wanted to stop filtering is the annoying
             // version of this.
             KeyCode::Esc => {
-                if self.filter.turn.is_none() {
+                if self.filter.trace.is_none() {
                     return Ok(Flow::Quit);
                 }
-                self.filter.turn = None;
-                self.reload_stream(trace)?;
+                self.filter.trace = None;
+                self.reload_stream(store)?;
             }
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(true),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(false),
             KeyCode::Enter => {
+                // A turn is one trace, so pinning it is a trace filter: the
+                // children of a turn carry no turn id of their own.
                 if let Some(turn) = self.turns.get(self.selected) {
-                    self.filter.turn = Some(turn.turn.clone());
-                    self.reload_stream(trace)?;
+                    self.filter.trace = Some(turn.trace_id.clone());
+                    self.reload_stream(store)?;
                 }
             }
             KeyCode::Char('p') => self.paused = !self.paused,
@@ -267,13 +272,13 @@ fn header_line(dashboard: &Dashboard) -> Paragraph<'_> {
         Span::styled("starkbot-trace", Style::new().add_modifier(Modifier::BOLD)),
         Span::styled("  last 15 min  ", Style::new().fg(GREY)),
         Span::raw(format!(
-            "{} records · {} turns · {} inferences",
-            dashboard.stats.records, dashboard.stats.turns, dashboard.stats.inferences
+            "{} spans · {} turns · {} inferences",
+            dashboard.stats.spans, dashboard.stats.turns, dashboard.stats.inferences
         )),
     ];
-    if let Some(turn) = dashboard.filter.turn.as_deref() {
+    if let Some(trace) = dashboard.filter.trace.as_deref() {
         spans.push(Span::styled(
-            format!("   pinned to turn {}", short_id(turn)),
+            format!("   pinned to trace {}", short_id(trace)),
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
     }
@@ -287,7 +292,7 @@ fn header_line(dashboard: &Dashboard) -> Paragraph<'_> {
 }
 
 fn footer_line(dashboard: &Dashboard) -> Paragraph<'_> {
-    let escape = if dashboard.filter.turn.is_some() {
+    let escape = if dashboard.filter.trace.is_some() {
         "Esc clears the pin"
     } else {
         "Esc quits"
@@ -344,8 +349,8 @@ fn turn_line(turn: &TurnSummary, selected: bool, width: usize) -> Line<'static> 
     let head = format!(
         "{marker}{} {:<8} {:<11} {:>3}s {:>3}i {:>4}j {:>6}/{:<6} {}",
         stamp(turn.started_ms),
-        short_id(&turn.turn),
-        clip(&turn.source, 11),
+        short_id(&turn.trace_id),
+        clip(turn.source(), 11),
         turn.steps,
         turn.inferences,
         turn.jev_steps,
@@ -363,11 +368,11 @@ fn turn_line(turn: &TurnSummary, selected: bool, width: usize) -> Line<'static> 
 }
 
 fn render_stream(frame: &mut Frame, area: Rect, dashboard: &Dashboard) {
-    let title = match dashboard.filter.turn.as_deref() {
-        Some(turn) => format!(" Stream · turn {} ", short_id(turn)),
+    let title = match dashboard.filter.trace.as_deref() {
+        Some(trace) => format!(" Stream · trace {} ", short_id(trace)),
         None => " Stream ".to_owned(),
     };
-    let border = if dashboard.filter.turn.is_some() {
+    let border = if dashboard.filter.trace.is_some() {
         Style::new().fg(Color::Cyan)
     } else {
         Style::new().fg(GREY)
@@ -380,10 +385,10 @@ fn render_stream(frame: &mut Frame, area: Rect, dashboard: &Dashboard) {
     }
 
     if dashboard.stream.is_empty() {
-        let empty = if dashboard.filter.turn.is_some() {
-            "no records for this turn yet"
+        let empty = if dashboard.filter.trace.is_some() {
+            "no spans for this trace yet"
         } else {
-            "nothing has arrived yet — records appear here as soon as an agent connects"
+            "nothing has arrived yet — spans appear here as soon as an agent posts them"
         };
         frame.render_widget(
             Paragraph::new(Line::styled(empty, Style::new().fg(GREY))).wrap(Wrap { trim: false }),
@@ -392,7 +397,7 @@ fn render_stream(frame: &mut Frame, area: Rect, dashboard: &Dashboard) {
         return;
     }
 
-    // The newest record is the one being read, so the pane shows the tail of
+    // The newest span is the one being read, so the pane shows the tail of
     // the ring and never scrolls away from it.
     let height = usize::from(inner.height);
     let width = usize::from(inner.width);
@@ -401,36 +406,39 @@ fn render_stream(frame: &mut Frame, area: Rect, dashboard: &Dashboard) {
         .stream
         .iter()
         .skip(skip)
-        .map(|row| stream_line(row, width))
+        .map(|span| stream_line(span, width))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn stream_line(row: &Row, width: usize) -> Line<'static> {
-    let duration = row.duration_ms.map(fmt_ms).unwrap_or_default();
+fn stream_line(span: &StoredSpan, width: usize) -> Line<'static> {
     let text = format!(
         "{} {:<18} {:>8}  {}",
-        clock(row.ts_ms),
-        clip(&row.kind, 18),
-        duration,
-        row.label
+        clock(span.start_ms()),
+        clip(&span.name, 18),
+        fmt_ms(span.duration_ms),
+        span.label
     );
-    let style = match row.ok {
-        Some(false) => Style::new().fg(Color::Red),
-        _ => kind_style(&row.kind),
+    let style = if span.failed() {
+        Style::new().fg(Color::Red)
+    } else {
+        name_style(&span.name)
     };
     Line::styled(clip(&text, width), style)
 }
 
-/// Colour carries no information on its own here — the kind is spelled out in
-/// its own column — it only makes the shape of a turn visible at a glance.
-fn kind_style(kind: &str) -> Style {
-    match kind {
-        "turn_started" | "turn_finished" => Style::new().fg(Color::Cyan),
-        "turn_failed" => Style::new().fg(Color::Red),
-        "inference" => Style::new().fg(Color::Blue),
-        "jev_step" => Style::new().fg(GREY),
-        _ => Style::new(),
+/// Colour carries no information on its own here — the span name is spelled
+/// out in its own column — it only makes the shape of a turn visible at a
+/// glance.
+fn name_style(name: &str) -> Style {
+    if name == "invoke_agent" {
+        Style::new().fg(Color::Cyan)
+    } else if name.starts_with("chat ") {
+        Style::new().fg(Color::Blue)
+    } else if name.starts_with("jev ") {
+        Style::new().fg(GREY)
+    } else {
+        Style::new()
     }
 }
 
@@ -445,7 +453,7 @@ fn render_stats(frame: &mut Frame, area: Rect, dashboard: &Dashboard) {
     }
 
     let stats = &dashboard.stats;
-    if stats.records == 0 {
+    if stats.spans == 0 {
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "quiet — nothing in the last fifteen minutes",
@@ -458,7 +466,7 @@ fn render_stats(frame: &mut Frame, area: Rect, dashboard: &Dashboard) {
     }
 
     let mut lines = vec![
-        count_line("records", stats.records),
+        count_line("spans", stats.spans),
         count_line("runs", stats.runs),
         count_line("turns", stats.turns),
         count_line("steps", stats.steps),
@@ -522,11 +530,11 @@ fn latency_line(label: &str, percentiles: &crate::store::Percentiles) -> Line<'s
     ])
 }
 
-/// The start of the summary window, in unix milliseconds.
+/// The start of the summary window, in unix nanoseconds.
 fn window_start() -> i64 {
-    now_ms().saturating_sub(WINDOW_MS)
+    now_ns().saturating_sub(WINDOW_NS)
 }
 
-fn now_ms() -> i64 {
-    i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
+fn now_ns() -> i64 {
+    i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(0)
 }
