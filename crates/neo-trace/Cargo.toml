@@ -1,0 +1,21 @@
+[package]
+name = "neo-trace"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Fire-and-forget tracing producer: what Starkbot Neo did, streamed to a collector without ever slowing the agent down."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

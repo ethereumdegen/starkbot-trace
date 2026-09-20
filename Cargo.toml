@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+
+[workspace.lints]
+rust = { unsafe_code = "deny", unused_must_use = "deny" }
+clippy = { unwrap_used = "deny", expect_used = "warn", dbg_macro = "deny", print_stdout = "deny", await_holding_lock = "deny" }
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+ratatui = "0.30"
+rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite_migration = "=2.5.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"
+time = { version = "0.3", features = ["serde", "formatting"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+neo-trace = { path = "crates/neo-trace" }
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+split-debuginfo = "packed"
+panic = "unwind"
