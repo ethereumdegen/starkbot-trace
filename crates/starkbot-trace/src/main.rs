@@ -9,6 +9,7 @@
 //! process that produced it, which is the only reason any of this is useful
 //! after a crash.
 
+mod otlp;
 mod report;
 mod server;
 mod store;
@@ -51,6 +52,13 @@ enum Command {
         /// Also append every raw line here, for `jq`.
         #[arg(long, value_name = "PATH")]
         mirror: Option<PathBuf>,
+        /// Also forward each turn to this OTLP endpoint as it closes. The
+        /// base URL, e.g. `http://localhost:4318`.
+        #[arg(long, value_name = "URL")]
+        otlp: Option<String>,
+        /// An extra header on every OTLP request, `name: value`. Repeatable.
+        #[arg(long = "header", value_name = "K: V")]
+        header: Vec<String>,
     },
     /// The most recent records.
     Tail {
@@ -114,6 +122,34 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Map stored records to OpenTelemetry spans and send them over OTLP.
+    Export {
+        /// The collector's base URL, e.g. `http://localhost:4318`. Defaults
+        /// to `$OTEL_EXPORTER_OTLP_ENDPOINT`.
+        #[arg(long, value_name = "URL")]
+        otlp: Option<String>,
+        /// An extra header on every OTLP request, `name: value`. Repeatable.
+        /// `$OTEL_EXPORTER_OTLP_HEADERS` is read too, in its `k=v,k2=v2`
+        /// form; a flag of the same name wins.
+        #[arg(long = "header", value_name = "K: V")]
+        header: Vec<String>,
+        /// Only the last this many minutes.
+        #[arg(long, value_name = "MINUTES")]
+        since: Option<i64>,
+        /// Only this turn. An id prefix is enough.
+        #[arg(long, value_name = "ID")]
+        turn: Option<String>,
+        /// Only this run. An id prefix is enough.
+        #[arg(long, value_name = "ID")]
+        run: Option<String>,
+        /// Keep exporting as new records arrive. Each turn goes out once it
+        /// has closed.
+        #[arg(long)]
+        follow: bool,
+        /// Print the OTLP payload instead of sending it.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// A live dashboard. q or Esc quits.
     Watch,
 }
@@ -124,7 +160,12 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { socket, mirror } => {
+        Command::Serve {
+            socket,
+            mirror,
+            otlp,
+            header,
+        } => {
             let socket = match socket {
                 Some(path) => path,
                 None => server::default_socket()?,
@@ -132,8 +173,18 @@ fn main() -> Result<()> {
             let database = database_path(cli.db)?;
             eprintln!("trace: socket {}", socket.display());
             eprintln!("trace: database {}", database.display());
+            // Built before the listener starts: a bad endpoint or an
+            // unparseable header should stop the collector here, not on the
+            // first turn hours later.
+            let egress = match otlp {
+                Some(endpoint) => {
+                    eprintln!("trace: exporting to {endpoint}");
+                    Some(otlp::Egress::new(Some(&endpoint), &header, false)?)
+                }
+                None => None,
+            };
             let trace = Arc::new(Trace::open(&database)?);
-            run_serve(trace, socket, mirror)
+            run_serve(trace, socket, mirror, egress)
         }
         Command::Tail {
             limit,
@@ -175,12 +226,53 @@ fn main() -> Result<()> {
             let trace = open(cli.db)?;
             watch::watch(&trace)
         }
+        Command::Export {
+            otlp,
+            header,
+            since,
+            turn,
+            run,
+            follow,
+            dry_run,
+        } => {
+            let trace = open(cli.db)?;
+            let filter = Filter {
+                run,
+                turn,
+                kinds: Vec::new(),
+                since_ms: since.map(minutes_ago),
+                text: None,
+            };
+            let egress = otlp::Egress::new(otlp.as_deref(), &header, dry_run)?;
+            run_export(trace, filter, egress, follow)
+        }
     }
 }
 
 #[tokio::main]
-async fn run_serve(trace: Arc<Trace>, socket: PathBuf, mirror: Option<PathBuf>) -> Result<()> {
-    server::serve(trace, &socket, mirror.as_deref()).await
+async fn run_serve(
+    trace: Arc<Trace>,
+    socket: PathBuf,
+    mirror: Option<PathBuf>,
+    egress: Option<otlp::Egress>,
+) -> Result<()> {
+    server::serve(trace, &socket, mirror.as_deref(), egress).await
+}
+
+/// The export needs a reactor for the same reason `serve` does and for no
+/// other: `reqwest` is async.
+#[tokio::main]
+async fn run_export(
+    trace: Trace,
+    filter: Filter,
+    egress: otlp::Egress,
+    follow: bool,
+) -> Result<()> {
+    if follow {
+        otlp::follow(&trace, &filter, &egress).await
+    } else {
+        otlp::export(&trace, &filter, &egress).await
+    }
 }
 
 fn open(db: Option<PathBuf>) -> Result<Trace> {

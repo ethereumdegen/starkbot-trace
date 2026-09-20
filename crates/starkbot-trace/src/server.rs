@@ -25,7 +25,18 @@ use crate::store::Trace;
 const PROGRESS_EVERY: u64 = 200;
 
 /// Accept trace connections on `socket` until Ctrl-C.
-pub async fn serve(trace: Arc<Trace>, socket: &Path, mirror: Option<&Path>) -> Result<()> {
+///
+/// `egress`, when there is one, turns the collector into a live exporter as
+/// well as a store. It runs as its own task and is reached through a
+/// doorbell channel, never awaited here: an OTLP endpoint is somewhere else
+/// on a network, and a producer whose records had to wait for it would be an
+/// agent slowed down by its own tracing.
+pub async fn serve(
+    trace: Arc<Trace>,
+    socket: &Path,
+    mirror: Option<&Path>,
+    egress: Option<crate::otlp::Egress>,
+) -> Result<()> {
     if let Some(parent) = socket.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -51,6 +62,10 @@ pub async fn serve(trace: Arc<Trace>, socket: &Path, mirror: Option<&Path>) -> R
         None => None,
     };
     let total = Arc::new(AtomicU64::new(0));
+    let exporter = match egress {
+        Some(egress) => Some(crate::otlp::spawn_live(Arc::clone(&trace), egress)?),
+        None => None,
+    };
 
     loop {
         tokio::select! {
@@ -59,8 +74,9 @@ pub async fn serve(trace: Arc<Trace>, socket: &Path, mirror: Option<&Path>) -> R
                     let trace = Arc::clone(&trace);
                     let mirror = mirror.clone();
                     let total = Arc::clone(&total);
+                    let exporter = exporter.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = drain(stream, trace, mirror, total).await {
+                        if let Err(error) = drain(stream, trace, mirror, total, exporter).await {
                             eprintln!("trace: connection ended badly: {error}");
                         }
                     });
@@ -79,6 +95,11 @@ pub async fn serve(trace: Arc<Trace>, socket: &Path, mirror: Option<&Path>) -> R
         }
     }
 
+    // The live exporter stops when its last doorbell is gone, and flushes the
+    // turns it is still holding on the way out. Connections that outlive the
+    // listener keep their own clones, so it stays up for as long as a producer
+    // is still talking.
+    drop(exporter);
     drop(listener);
     // Leaving the socket behind would make the next producer connect to
     // nothing and wait for a reader that never comes.
@@ -124,6 +145,7 @@ async fn drain(
     trace: Arc<Trace>,
     mirror: Option<Mirror>,
     total: Arc<AtomicU64>,
+    exporter: Option<tokio::sync::mpsc::Sender<()>>,
 ) -> Result<()> {
     let peer = stream
         .peer_cred()
@@ -136,6 +158,7 @@ async fn drain(
     let mut stored = 0_u64;
     let mut bad = 0_u64;
     let mut foreign = 0_u64;
+    let mut dropped_wakes = 0_u64;
     let mut source = String::new();
 
     loop {
@@ -203,6 +226,21 @@ async fn drain(
                 let seen = total.fetch_add(1, Ordering::Relaxed) + 1;
                 if seen.is_multiple_of(PROGRESS_EVERY) {
                     eprintln!("trace: {seen} records stored");
+                }
+                if let Some(exporter) = &exporter
+                    && exporter.try_send(()).is_err()
+                {
+                    // The exporter is behind or gone. `try_send` rather than
+                    // `send` is the whole point: the record is already on
+                    // disk, the exporter reads the store itself and polls on
+                    // a timer anyway, so a dropped doorbell costs a batch a
+                    // quarter of a second and the producer nothing.
+                    dropped_wakes += 1;
+                    if dropped_wakes.is_multiple_of(PROGRESS_EVERY) {
+                        eprintln!(
+                            "trace: the OTLP exporter is behind; {dropped_wakes} wake-ups dropped"
+                        );
+                    }
                 }
             }
             Err(error) => {

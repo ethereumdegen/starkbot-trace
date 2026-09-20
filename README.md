@@ -94,6 +94,100 @@ let turn = neo_trace::new_turn_id();
 neo_trace::turn_scope(turn, async { do_work().await }).await;
 ```
 
+## OpenTelemetry
+
+The Unix socket and the SQLite file are this tool's own shape: fast to write,
+cheap to query, and readable by nothing else. OTLP is the other direction —
+the same records mapped to OpenTelemetry spans and posted to whatever already
+collects traces, so an agent turn lands next to the rest of your telemetry
+instead of in a database only `starkbot-trace` can read.
+
+Nothing about the socket changes. `neo-trace` gains no dependencies: the agent
+still writes NDJSON to a local socket and the collector does the mapping, so a
+backend that is slow, far away or down is the collector's problem and never
+the agent's.
+
+Two commands:
+
+```sh
+# Everything from the last ten hours, to a Collector on this machine.
+starkbot-trace export --otlp http://localhost:4318 --since 600
+
+# The mapping, on stdout, with no backend anywhere.
+starkbot-trace export --dry-run --since 600 | jq '.resourceSpans[].scopeSpans[].spans[].name'
+
+# Keep exporting as records land. A turn goes out when it closes.
+starkbot-trace export --otlp http://localhost:4318 --follow
+
+# Or collect and forward in one process.
+starkbot-trace serve --otlp http://localhost:4318
+```
+
+`export` also takes `--turn`, `--run` and `--header 'name: value'` (repeatable,
+for an endpoint that wants an API key). The endpoint is a base URL; `/v1/traces`
+is appended, and an endpoint that already ends in it is left alone. The
+standard variables are read as defaults:
+
+| Variable | Meaning |
+| --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | the base URL, when `--otlp` is not given |
+| `OTEL_EXPORTER_OTLP_HEADERS` | extra headers as `k=v,k2=v2`; a `--header` of the same name wins |
+
+The transport is OTLP over HTTP with JSON encoding, built by hand. There is no
+`opentelemetry` SDK, no protobuf and no gRPC here: the payload is a documented,
+stable schema, and a program whose job is to still be running in six months
+does not need a code generator to post a JSON document.
+
+### What a record becomes
+
+| kind | span |
+| --- | --- |
+| `turn_started` + `turn_finished` / `turn_failed` | one root span, `invoke_agent`, spanning the whole turn |
+| `turn_step` + `turn_step_finished` | one child span, `execute_tool`, with `gen_ai.tool.name` |
+| `inference` | `chat {model}`, with `gen_ai.system`, `gen_ai.request.model` and the token counts |
+| `surface_run` | `navigate {surface}` |
+| `jev_step` | `jev {operation}`, under the navigator run that was open at the time |
+| `app_event`, `log`, `process_started` | span events on the turn they happened in |
+
+Trace ids are derived from the turn id, so re-exporting a turn updates a trace
+rather than duplicating it. A record outside a turn gets a trace of its own.
+Every span carries `starkbot.record_id`, the rowid, so a span in a backend can
+be taken back to `starkbot-trace tail` and the record it came from. Attributes
+follow the OpenTelemetry GenAI semantic conventions where those exist and
+`starkbot.*` where they do not.
+
+### Against a Collector on :4318
+
+```yaml
+# otel.yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+exporters:
+  debug:
+    verbosity: detailed
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+```
+
+```sh
+docker run --rm -p 4318:4318 -v "$PWD/otel.yaml:/etc/otel.yaml" \
+  otel/opentelemetry-collector:latest --config /etc/otel.yaml
+
+starkbot-trace export --otlp http://localhost:4318 --since 600
+# trace: 315 records mapped to 231 spans
+```
+
+Batches are at most 200 spans. A 429 or a 5xx is retried up to four times with
+backoff, honouring `Retry-After`; a 4xx fails immediately and says why. A batch
+that cannot be delivered is reported and the rest of the export continues, and
+the command exits non-zero if anything failed.
+
 ## License
 
 MIT.
