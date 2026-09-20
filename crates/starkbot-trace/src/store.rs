@@ -254,6 +254,24 @@ impl Store {
             .to_latest(&mut connection)
             .map_err(|error| anyhow!("could not migrate the trace database: {error}"))?;
 
+        // A database from the socket era carries `records` at the same schema
+        // version this build uses for `spans`, so the migration runs as a
+        // no-op and every query afterwards fails with "no such table: spans".
+        // Saying which file and what to do with it beats that.
+        let stale: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'records') \
+             AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spans')",
+            [],
+            |row| row.get(0),
+        )?;
+        if stale {
+            return Err(anyhow!(
+                "{} holds records from the pre-OTLP collector, which stored its own wire format \
+                 rather than spans. Delete it (or point --db somewhere else) and receive again.",
+                path.display()
+            ));
+        }
+
         Ok(Self {
             connection: Mutex::new(connection),
         })
